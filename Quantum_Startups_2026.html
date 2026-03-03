@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html lang="fr"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Informatique Quantique — Synthèse Forum 2026</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Syne:wght@400;700;800&display=swap');
+  :root{--bg:#0a0a0f;--surface:#12121a;--border:#1e1e2e;--accent:#7c6af7;--accent2:#3dd9b3;--warn:#f7a76a;--green:#4ade80;--red:#f87171;--text:#e2e2f0;--muted:#6b6b8a;}
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{background:var(--bg);color:var(--text);font-family:'Syne',sans-serif;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:40px 20px;}
+  .container{max-width:800px;width:100%;}
+  /* download bar */
+  .dl-bar{display:flex;justify-content:space-between;align-items:center;background:rgba(124,106,247,.1);border:1px solid rgba(124,106,247,.25);border-radius:10px;padding:12px 18px;margin-bottom:28px;}
+  .dl-bar span{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--muted);}
+  .dl-btn{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:700;background:var(--accent);color:#fff;border:none;padding:8px 18px;border-radius:8px;cursor:pointer;letter-spacing:1px;transition:opacity .2s;}
+  .dl-btn:hover{opacity:.8;}
+  .dl-btn.done{background:var(--accent2);color:#0a0a0f;}
+  /* header */
+  .header{text-align:center;margin-bottom:32px;}
+  .tag{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--accent2);letter-spacing:3px;text-transform:uppercase;margin-bottom:12px;}
+  h1{font-size:clamp(22px,4vw,36px);font-weight:800;line-height:1.1;background:linear-gradient(135deg,#fff 30%,var(--accent));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;margin-bottom:10px;}
+  .subtitle{color:var(--muted);font-size:13px;font-family:'JetBrains Mono',monospace;}
+  /* copy area */
+  .copy-area{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;margin-bottom:20px;}
+  .copy-bar{display:flex;justify-content:space-between;align-items:center;padding:10px 16px;background:rgba(124,106,247,.08);border-bottom:1px solid var(--border);}
+  .copy-bar span{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted);letter-spacing:1px;}
+  .copy-btn{font-family:'JetBrains Mono',monospace;font-size:11px;background:var(--accent);color:#fff;border:none;padding:5px 14px;border-radius:6px;cursor:pointer;transition:opacity .2s;letter-spacing:1px;}
+  .copy-btn:hover{opacity:.8;}
+  .copy-btn.copied{background:var(--accent2);color:#0a0a0f;}
+  #forum-content{padding:22px;white-space:pre-wrap;font-family:'JetBrains Mono',monospace;font-size:12.5px;line-height:1.85;color:#c8c8e0;outline:none;}
+  /* preview */
+  .preview{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;}
+  .preview-bar{padding:10px 16px;background:rgba(61,217,179,.06);border-bottom:1px solid var(--border);font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--accent2);letter-spacing:1px;}
+  .preview-body{padding:26px 24px;font-size:14px;line-height:1.75;}
+  .preview-body h2{font-size:19px;font-weight:800;margin:28px 0 10px;color:#fff;}
+  .preview-body h2:first-child{margin-top:0;}
+  .preview-body p{margin-bottom:10px;color:#b8b8d0;}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:16px 0;}
+  @media(max-width:520px){.grid{grid-template-columns:1fr;}}
+  .card{background:rgba(124,106,247,.06);border:1px solid rgba(124,106,247,.15);border-radius:10px;padding:14px 16px;}
+  .card .emoji{font-size:20px;display:block;margin-bottom:6px;}
+  .card .name{font-weight:700;font-size:14px;color:#fff;margin-bottom:2px;}
+  .card .tech{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--accent2);margin-bottom:8px;}
+  .card .desc{font-size:12px;color:var(--muted);line-height:1.55;margin-bottom:10px;}
+  .graal{background:linear-gradient(135deg,rgba(255,200,0,.06),rgba(124,106,247,.1));border-color:rgba(255,200,0,.25);}
+  .graal .tech{color:#ffd700;}
+  .access-row{display:flex;align-items:flex-start;gap:6px;flex-wrap:wrap;}
+  .badge{display:inline-flex;align-items:center;gap:4px;font-family:'JetBrains Mono',monospace;font-size:10px;padding:3px 8px;border-radius:20px;white-space:nowrap;font-weight:700;}
+  .badge.closed{background:rgba(248,113,113,.12);color:var(--red);border:1px solid rgba(248,113,113,.25);}
+  .badge.soon{background:rgba(247,167,106,.12);color:var(--warn);border:1px solid rgba(247,167,106,.25);}
+  .badge.imminent{background:rgba(74,222,128,.12);color:var(--green);border:1px solid rgba(74,222,128,.25);}
+  .badge.secondary{background:rgba(124,106,247,.12);color:var(--accent);border:1px solid rgba(124,106,247,.25);}
+  .ipo-note{font-size:11px;color:var(--muted);font-family:'JetBrains Mono',monospace;line-height:1.5;margin-top:6px;}
+  .table-wrap{overflow-x:auto;margin:16px 0;}
+  table{width:100%;border-collapse:collapse;font-size:12.5px;}
+  th{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:1px;color:var(--muted);text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);}
+  td{padding:10px 10px;border-bottom:1px solid rgba(30,30,46,.7);color:#b8b8d0;}
+  tr:last-child td{border:none;}
+  td:first-child{color:#fff;font-weight:600;}
+  .disclaimer{margin-top:16px;padding:12px 16px;background:rgba(107,107,138,.1);border-left:2px solid var(--muted);border-radius:4px;font-size:11px;color:var(--muted);font-family:'JetBrains Mono',monospace;line-height:1.6;}
+  .footer{text-align:center;margin-top:28px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted);}
+</style>
+</head>
+<body id="artifacts-component-root-html">
+<div class="container">
+
+  <!-- BOUTON TÉLÉCHARGEMENT -->
+  <div class="dl-bar">
+    <span>⚛️ Quantum_Startups_2026.html — prêt pour GitHub / htmlpreview</span>
+    <button class="dl-btn" id="dlBtn" onclick="dlPage()">⬇ Télécharger</button>
+  </div>
+
+  <div class="header">
+    <div class="tag">📡 Private Equity · Quantum Tech · 2026</div>
+    <h1>5 Start-ups Quantiques<br>à Suivre</h1>
+    <div class="subtitle">Synthèse forum — technologies, accès capital &amp; IPO</div>
+  </div>
+
+  <div class="copy-area">
+    <div class="copy-bar">
+      <span>📋 TEXTE BRUT — COPIER POUR FORUM</span>
+      <button class="copy-btn" id="copyBtn" onclick="copyText()">Copier</button>
+    </div>
+    <div id="forum-content">🔬 INFORMATIQUE QUANTIQUE — 5 START-UPS PRIVÉES À SUIVRE EN 2026
+Capital ouvert / fermé &amp; horizons IPO
+══════════════════════════════════════════════════
+
+Le secteur a levé ~$3,77 Mds sur les 9 premiers mois de 2025, soit presque 3× toute l'année 2024.
+Voici mon analyse des 5 acteurs les plus intéressants, chacun sur une technologie différente.
+
+══════════════════════════════════════════════════
+🏆 PSIQUANTUM — LA QUÊTE DU GRAAL | Photonique
+══════════════════════════════════════════════════
+Valorisation : ~$7 Mds | Total levé : &gt;$2,1 Mds (Series E sept. 2025)
+Investisseurs : BlackRock, Temasek, NVIDIA, Qatar Investment Authority, Morgan Stanley
+
+La seule qui vise explicitement l'ordinateur quantique tolérant aux fautes à grande échelle.
+Pari : photons + fabrication en masse via fonderies classiques (GlobalFoundries).
+Quantum Compute Centers en construction : Brisbane (Australie) &amp; Chicago.
+Cible opérationnelle : systèmes à grande échelle d'ici 2027.
+
+🔒 CAPITAL FERMÉ — Série E bouclée en septembre 2025
+💡 Accès secondaire possible via EquityZen / Forge (investisseurs accrédités uniquement)
+📅 IPO : pas d'annonce officielle — probablement 2028+ (technologie encore en validation)
+→ Risque : ★★★★★ | Horizon : 7-10 ans | Potentiel : exceptionnel si succès
+
+══════════════════════════════════════════════════
+💎 QUANTINUUM — LA ROLLS ROYCE DE LA FIDÉLITÉ | Ions piégés
+══════════════════════════════════════════════════
+Valorisation : $10 Mds | Levée : $600M (sept. 2025)
+Investisseurs : NVIDIA, JPMorgan, SoftBank, Mitsui, Fidelity
+
+Record mondial de fidélité : 99,9975% sur 98 qubits (système Helios).
+Détenue majoritairement par Honeywell (52%) qui se restructure en 3 entités.
+Sélectionnée par DARPA pour le programme Quantum Benchmarking Initiative.
+
+🔒 CAPITAL FERMÉ — round $600M bouclé en sept. 2025
+⚡ IPO IMMINENTE — dépôt S-1 confidentiel auprès de la SEC annoncé le 14 jan. 2026
+📅 IPO attendue : H1-H2 2026
+💡 Accès indirect dès maintenant via Honeywell (NASDAQ: HON)
+💡 Accès secondaire pré-IPO via UpMarket / Forge (accrédités uniquement)
+→ Risque : ★★★☆☆ | Horizon : ~1 an | Fenêtre pre-IPO encore étroite mais ouverte
+
+══════════════════════════════════════════════════
+🇫🇷 PASQAL — LE CHAMPION EUROPÉEN | Atomes neutres
+══════════════════════════════════════════════════
+Valorisation : n.c. | Total levé : ~€152M
+Investisseurs : Temasek, EIC, Ministère des Armées FR, BPI France
+
+Spin-off de l'Institut d'Optique / Prix Nobel Alain Aspect.
+Scalabilité théorique solide, applications en simulation moléculaire et optimisation.
+Soutien institutionnel européen massif. Base client établie.
+
+🔒 CAPITAL FERMÉ — dernier tour bouclé
+📅 IPO : cotation européenne anticipée courant 2026
+💡 Accès secondaire possible via EquityZen (accrédités uniquement)
+→ Risque : ★★★☆☆ | Horizon : 3-5 ans | Meilleur profil EU pour investisseur européen
+
+══════════════════════════════════════════════════
+⚛️ QUERA COMPUTING — L'ACADÉMIQUE AMÉRICAIN | Atomes neutres
+══════════════════════════════════════════════════
+Valorisation : n.c. | Total levé : $230M+ (fév. 2025)
+Investisseurs : Google Quantum AI, SoftBank Vision Fund
+
+Spin-off Harvard/MIT. Système Aquila 256 qubits accessible via AWS Braket.
+Reconfiguration dynamique des qubits = avantage architectural majeur.
+DARPA QBI validé — signal fort de crédibilité technique.
+
+🔒 CAPITAL FERMÉ — round fév. 2025 bouclé
+📅 IPO : pas d'annonce — horizon probable 2027+
+💡 Accès secondaire limité (pas encore sur les grandes plateformes)
+→ Risque : ★★★★☆ | Horizon : 3-5 ans | Signal Google fort, ticket post-levée élevé
+
+══════════════════════════════════════════════════
+💻 CLASSIQ — LE CERVEAU LOGICIEL | Software quantique
+══════════════════════════════════════════════════
+Valorisation : n.c. | Levée Série C : $110M (mai 2025)
+Investisseurs : Samsung Next, HSBC, NightDragon, Entrée Capital
+
+Pure-play software, hardware-agnostic (IBM, IonQ, Quantinuum...).
+Classiq 1.0 : plateforme de programmation quantique production-ready.
+Revenus récurrents, pas besoin de cryogénie.
+
+🔒 CAPITAL FERMÉ — Série C bouclée en mai 2025
+📅 IPO : pas d'annonce officielle — horizon possible 2026-2027
+💡 Accès : contacter les fonds investisseurs ou plateformes spécialisées
+→ Risque : ★★☆☆☆ | Horizon : 1-3 ans | Meilleur profil risque/rendement court terme
+
+══════════════════════════════════════════════════
+📊 SYNTHÈSE INVESTISSEUR
+══════════════════════════════════════════════════
+
+| Start-up     | Technologie     | Capital  | IPO prévue  | Risque  | Horizon  |
+|--------------|-----------------|----------|-------------|---------|----------|
+| PsiQuantum   | Photonique      | 🔒 Fermé | ~2028+      | ★★★★★  | 7-10 ans |
+| Quantinuum   | Ions piégés     | 🔒 Fermé | ⚡ 2026     | ★★★☆☆  | ~1 an    |
+| PASQAL       | Atomes neutres  | 🔒 Fermé | ~2026       | ★★★☆☆  | 3-5 ans  |
+| QuEra        | Atomes neutres  | 🔒 Fermé | ~2027+      | ★★★★☆  | 3-5 ans  |
+| Classiq      | Software        | 🔒 Fermé | 2026-27 ?   | ★★☆☆☆  | 1-3 ans  |
+
+• Accès le plus immédiat  → Quantinuum (HON en bourse + S-1 déposé jan. 2026)
+• Meilleur profil risque/rendement CT → Classiq
+• Optionalité maximale (si le graal) → PsiQuantum
+• Champion européen accessible → PASQAL
+
+⚠️ Tous les capitaux sont actuellement fermés au grand public.
+Accès secondaire pré-IPO possible via EquityZen, Forge, UpMarket
+(réservé aux investisseurs accrédités uniquement).
+Ceci n'est pas un conseil financier — due diligence obligatoire.</div>
+  </div>
+
+  <div class="preview">
+    <div class="preview-bar">👁 APERÇU RENDU</div>
+    <div class="preview-body">
+      <h2>🔬 5 Start-ups Quantiques à Suivre en 2026</h2>
+      <p>Le secteur a levé <strong>~$3,77 Mds</strong> sur les 9 premiers mois de 2025 — presque 3× l'année 2024. Tous les capitaux sont fermés, mais des fenêtres d'accès existent.</p>
+      <div class="grid">
+        <div class="card graal">
+          <span class="emoji">🏆</span>
+          <div class="name">PsiQuantum</div>
+          <div class="tech">Photonique · ~$7 Mds</div>
+          <div class="desc">La quête du Graal. Fabrication via fonderies classiques. Quantum Centers Brisbane &amp; Chicago. Cible 2027.</div>
+          <div class="access-row"><span class="badge closed">🔒 Fermé</span><span class="badge secondary">Secondaire: EquityZen</span></div>
+          <div class="ipo-note">📅 IPO : ~2028+ (techno en validation)</div>
+        </div>
+        <div class="card">
+          <span class="emoji">💎</span>
+          <div class="name">Quantinuum</div>
+          <div class="tech">Ions piégés · $10 Mds</div>
+          <div class="desc">Record mondial 99,9975%. NVIDIA, JPMorgan, SoftBank. S-1 déposé le 14/01/2026.</div>
+          <div class="access-row"><span class="badge closed">🔒 Fermé</span><span class="badge imminent">⚡ IPO imminente</span></div>
+          <div class="ipo-note">📅 IPO H1-H2 2026 · 💡 Indirect: HON (NASDAQ)</div>
+        </div>
+        <div class="card">
+          <span class="emoji">🇫🇷</span>
+          <div class="name">PASQAL</div>
+          <div class="tech">Atomes neutres · Palaiseau</div>
+          <div class="desc">Spin-off Nobel Alain Aspect. BPI, Temasek, Armées FR. Cotation EU anticipée 2026.</div>
+          <div class="access-row"><span class="badge closed">🔒 Fermé</span><span class="badge soon">🕐 IPO ~2026</span></div>
+          <div class="ipo-note">💡 Secondaire: EquityZen (accrédités)</div>
+        </div>
+        <div class="card">
+          <span class="emoji">⚛️</span>
+          <div class="name">QuEra</div>
+          <div class="tech">Atomes neutres · $230M</div>
+          <div class="desc">Harvard/MIT. Google QAI + SoftBank. 256 qubits sur AWS. DARPA validé.</div>
+          <div class="access-row"><span class="badge closed">🔒 Fermé</span><span class="badge secondary">IPO ~2027+</span></div>
+          <div class="ipo-note">📅 Pas d'annonce · signal Google fort</div>
+        </div>
+      </div>
+      <div class="card" style="margin-bottom:16px">
+        <span class="emoji">💻</span>
+        <div class="name">Classiq</div>
+        <div class="tech">Software quantique · Série C $110M</div>
+        <div class="desc">Pure-play software, hardware-agnostic. Classiq 1.0 production-ready. Samsung Next, HSBC, NightDragon.</div>
+        <div class="access-row"><span class="badge closed">🔒 Fermé</span><span class="badge soon">🕐 IPO 2026-2027 ?</span></div>
+        <div class="ipo-note">📅 Pas d'annonce officielle · meilleur profil risque/rendement CT</div>
+      </div>
+      <h2>📊 Synthèse</h2>
+      <div class="table-wrap">
+        <table>
+          <tbody><tr><th>Start-up</th><th>Technologie</th><th>Capital</th><th>IPO prévue</th><th>Risque</th><th>Horizon</th></tr>
+          <tr><td>PsiQuantum</td><td>Photonique</td><td><span class="badge closed">🔒 Fermé</span></td><td>~2028+</td><td>★★★★★</td><td>7-10 ans</td></tr>
+          <tr><td>Quantinuum</td><td>Ions piégés</td><td><span class="badge closed">🔒 Fermé</span></td><td><span style="color:#4ade80">⚡ 2026</span></td><td>★★★☆☆</td><td>~1 an</td></tr>
+          <tr><td>PASQAL</td><td>Atomes neutres</td><td><span class="badge closed">🔒 Fermé</span></td><td>~2026</td><td>★★★☆☆</td><td>3-5 ans</td></tr>
+          <tr><td>QuEra</td><td>Atomes neutres</td><td><span class="badge closed">🔒 Fermé</span></td><td>~2027+</td><td>★★★★☆</td><td>3-5 ans</td></tr>
+          <tr><td>Classiq</td><td>Software</td><td><span class="badge closed">🔒 Fermé</span></td><td>2026-27 ?</td><td>★★☆☆☆</td><td>1-3 ans</td></tr>
+        </tbody></table>
+      </div>
+      <p style="margin-top:14px;font-size:13px;line-height:2">
+        <strong style="color:#fff">Accès le plus immédiat →</strong> <span style="color:#3dd9b3">Quantinuum</span> (HON en bourse + S-1 jan. 2026)<br>
+        <strong style="color:#fff">Meilleur risque/rendement CT →</strong> <span style="color:#3dd9b3">Classiq</span><br>
+        <strong style="color:#fff">Optionalité maximale →</strong> <span style="color:#ffd700">PsiQuantum</span><br>
+        <strong style="color:#fff">Champion EU accessible →</strong> <span style="color:#3dd9b3">PASQAL</span>
+      </p>
+      <div class="disclaimer">⚠️ Tous les capitaux sont fermés au grand public. Accès secondaire pré-IPO (EquityZen, Forge, UpMarket) réservé aux investisseurs accrédités. Pas un conseil financier.</div>
+    </div>
+  </div>
+  <div class="footer">mis à jour le 03/03/2026 · sources : SEC, presse spécialisée, plateformes pré-IPO</div>
+</div>
+
+<script>
+function dlPage() {
+  var html = '<!DOCTYPE html>\n' + document.documentElement.outerHTML;
+  var blob = new Blob([html], {type: 'text/html;charset=utf-8'});
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement('a');
+  a.href = url;
+  a.download = 'Quantum_Startups_2026.html';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  var btn = document.getElementById('dlBtn');
+  btn.textContent = '✓ Téléchargé !';
+  btn.classList.add('done');
+  setTimeout(function(){ btn.textContent = '⬇ Télécharger'; btn.classList.remove('done'); }, 3000);
+}
+function copyText() {
+  var t = document.getElementById('forum-content').innerText;
+  navigator.clipboard.writeText(t).then(function() {
+    var b = document.getElementById('copyBtn');
+    b.textContent = '✓ Copié !'; b.classList.add('copied');
+    setTimeout(function(){ b.textContent = 'Copier'; b.classList.remove('copied'); }, 2000);
+  });
+}
+</script>
+
+
+</body></html>
